@@ -1,15 +1,18 @@
 import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
 import { diffAgainstSnapshot } from './diff';
+import './reconcile-panel';
 import { SpecStore } from './store';
 import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
 
 type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
+type View = 'editor' | 'reconcile';
 
 export class SpecA11yWorkbench extends LitElement {
   static properties = {
     query: { state: true },
     tab: { state: true },
+    view: { state: true },
     previewTheme: { state: true },
     previewDensity: { state: true },
     toast: { state: true },
@@ -19,6 +22,7 @@ export class SpecA11yWorkbench extends LitElement {
   private store = new SpecStore();
   private query = '';
   private tab: EditorTab = 'overview';
+  private view: View = 'editor';
   private previewTheme: PreviewTheme = 'light';
   private previewDensity: PreviewDensity = 'regular';
   private toast = '';
@@ -203,6 +207,9 @@ export class SpecA11yWorkbench extends LitElement {
               ></sp-search>
               <sp-button variant="secondary" ?disabled=${!this.store.canUndo} @click=${() => this.store.undo()}>撤销</sp-button>
               <sp-button variant="secondary" ?disabled=${!this.store.canRedo} @click=${() => this.store.redo()}>重做</sp-button>
+              <sp-button variant="secondary" @click=${() => { this.view = this.view === 'reconcile' ? 'editor' : 'reconcile'; }}>
+                跨仓对账${this.store.pendingCandidates ? `（${this.store.pendingCandidates} 待裁定）` : ''}
+              </sp-button>
               <sp-button variant="accent" @click=${() => { this.store.createSnapshot('工具栏保存'); this.flash('版本已保存'); }}>保存版本</sp-button>
               <span class="save-state">本地自动保存 · ${selected?.revision ?? 0} 版</span>
             </div>
@@ -225,13 +232,18 @@ export class SpecA11yWorkbench extends LitElement {
                 `) : html`<div class="search-empty">没有匹配的组件。可尝试属性名、键盘行为或代码文本。</div>`}
               </div>
             </aside>
-            <main class="main">${selected ? this.renderEditor(selected) : html`<div class="empty">新建或选择组件开始编辑。</div>`}</main>
+            <main class="main">
+              ${this.view === 'reconcile'
+                ? html`<spec-reconcile-panel .store=${this.store}></spec-reconcile-panel>`
+                : selected ? this.renderEditor(selected) : html`<div class="empty">新建或选择组件开始编辑。</div>`}
+            </main>
             <aside class="inspector" aria-label="预览与检查">
               ${this.renderPreview(selected)}
               ${this.renderValidation(selectedIssues)}
             </aside>
           </div>
           ${this.toast ? html`<sp-toast open variant="positive" timeout="3000">${this.toast}</sp-toast>` : nothing}
+          ${this.store.lastError ? html`<sp-toast open variant="negative" timeout="5000" @click=${() => this.store.clearError()}>${this.store.lastError}</sp-toast>` : nothing}
           <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–5 切换面板</div>
         </div>
       </sp-theme>
@@ -327,6 +339,7 @@ export class SpecA11yWorkbench extends LitElement {
   private renderAccessibility(component: ComponentSpec): TemplateResult {
     return html`
       <section class="panel">
+        ${component.a11yStale ? html`<div class="issue warning" style="margin-bottom: 14px;"><strong>无障碍说明可能失效</strong>${component.a11yStaleReason}<br /><button @click=${() => this.store.recomputeA11y(component.id)}>重新核算</button></div>` : nothing}
         <div class="form-grid">
           <label class="field full"><span>键盘行为</span><textarea .value=${component.keyboardBehavior} @change=${(event: Event) => this.store.updateComponent({ keyboardBehavior: (event.currentTarget as HTMLTextAreaElement).value }, true)}></textarea></label>
           <label class="field full"><span>读屏说明</span><textarea .value=${component.screenReader} @change=${(event: Event) => this.store.updateComponent({ screenReader: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>

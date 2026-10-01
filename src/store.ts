@@ -1,7 +1,9 @@
+import { BUILTIN_PACKAGE, applyRelease as applyReleaseLogic, buildSession, recomputeA11y as recomputeA11yLogic } from './reconcile';
 import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import type { ComponentSnapshot, ComponentSpec, ReconcileSession, SpecPackage, ValidationIssue, WorkspaceState } from './types';
 
-const STORAGE_KEY = 'sologsb-1028-workspace-v1';
+const WORKSPACE_KEY = 'sologsb-1028-workspace-v1';
+const SESSION_KEY = 'sologsb-1028-reconcile-v1';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -9,13 +11,16 @@ const signature = (component: ComponentSpec) => `${component.properties.map((ite
 
 export class SpecStore extends EventTarget {
   state: WorkspaceState;
+  reconcileSession: ReconcileSession | null = null;
+  lastError = '';
   private undoStack: WorkspaceState[] = [];
   private redoStack: WorkspaceState[] = [];
   private lastAction = '';
 
   constructor() {
     super();
-    this.state = this.load();
+    this.state = this.loadWorkspace();
+    this.reconcileSession = this.loadSession();
   }
 
   get selected(): ComponentSpec | undefined {
@@ -25,11 +30,21 @@ export class SpecStore extends EventTarget {
   get canUndo() { return this.undoStack.length > 0; }
   get canRedo() { return this.redoStack.length > 0; }
   get lastUndoLabel() { return this.lastAction; }
+  get pendingCandidates(): number {
+    return this.reconcileSession?.status === 'in-progress'
+      ? this.reconcileSession.candidates.filter((item) => item.status === 'pending').length
+      : 0;
+  }
+
+  clearError() { this.lastError = ''; }
 
   select(id: string) {
     if (!this.state.components.some((item) => item.id === id)) return;
+    const previous = this.state;
     this.state = { ...this.state, selectedId: id };
-    this.persist(false);
+    if (!this.persistState(this.state)) {
+      this.state = previous;
+    }
     this.emit();
   }
 
@@ -51,7 +66,9 @@ export class SpecStore extends EventTarget {
       examples: [],
       revision: 1,
       updatedAt: new Date().toISOString(),
-      snapshots: []
+      snapshots: [],
+      a11yStale: false,
+      a11yStaleReason: ''
     };
     this.commit('新建组件', (state) => {
       state.components.unshift(component);
@@ -196,6 +213,83 @@ export class SpecStore extends EventTarget {
     });
   }
 
+  recomputeA11y(componentId: string) {
+    const target = this.state.components.find((item) => item.id === componentId);
+    if (!target) return;
+    this.commit('重新核算无障碍说明', (state) => {
+      const current = state.components.find((item) => item.id === componentId);
+      if (current) Object.assign(current, recomputeA11yLogic(current));
+    });
+  }
+
+  /* ---------------- 跨仓对账 ---------------- */
+
+  loadBuiltinPackage() {
+    this.loadReconcilePackage(BUILTIN_PACKAGE);
+  }
+
+  loadReconcilePackage(pkg: SpecPackage) {
+    this.reconcileSession = buildSession(pkg, this.state.components, (component) => this.baselineOf(component));
+    this.persistSession();
+    this.emit();
+  }
+
+  adjudicate(candidateId: string, decision: string) {
+    if (!this.reconcileSession) return;
+    const candidate = this.reconcileSession.candidates.find((item) => item.id === candidateId);
+    if (!candidate) return;
+    candidate.decision = decision;
+    candidate.status = 'decided';
+    this.persistSession();
+    this.emit();
+  }
+
+  discardReconcile() {
+    this.reconcileSession = null;
+    this.persistSession();
+    this.emit();
+  }
+
+  /** 应用所有裁定，生成待发布版本。事务性：超容量整批拒绝，工作区回滚。 */
+  applyRelease(): boolean {
+    if (!this.reconcileSession || this.reconcileSession.status !== 'in-progress') return false;
+    if (this.reconcileSession.candidates.some((item) => item.status === 'pending')) {
+      this.lastError = '还有候选未裁定，不能发布。';
+      this.emit();
+      return false;
+    }
+
+    const result = applyReleaseLogic(this.reconcileSession, this.state.components, (component) => this.baselineOf(component));
+    const before = clone(this.state);
+    const next: WorkspaceState = { ...this.state, components: result.components };
+
+    if (!this.persistState(next)) {
+      this.state = before;
+      this.emit();
+      return false;
+    }
+
+    this.undoStack.push(before);
+    this.undoStack = this.undoStack.slice(-40);
+    this.redoStack = [];
+    this.lastAction = '对账发布';
+    this.state = next;
+
+    this.reconcileSession.status = 'released';
+    this.reconcileSession.releasedAt = new Date().toISOString();
+    this.reconcileSession.releaseSummary = `更新 ${result.summary.updated} 个组件，新增 ${result.summary.added} 个；属性 +${result.summary.propertiesAdded}/-${result.summary.propertiesRemoved}/~${result.summary.propertiesModified}；${result.summary.examplesInvalidated} 个示例、${result.summary.a11yInvalidated} 份无障碍说明已失效重算。`;
+    this.persistSession();
+    this.emit();
+    return true;
+  }
+
+  /** 最近一次发布基线：优先快照，其次内置初始数据，再次为空。 */
+  private baselineOf(component: ComponentSpec): ComponentSpec | null {
+    if (component.snapshots.length) return component.snapshots[0].component as ComponentSpec;
+    const initial = createInitialState().components.find((item) => item.id === component.id);
+    return initial ?? null;
+  }
+
   validate(): ValidationIssue[] {
     const issues: ValidationIssue[] = [];
     for (const component of this.state.components) {
@@ -225,6 +319,9 @@ export class SpecStore extends EventTarget {
       if (contractChanged && component.examples.length) {
         issues.push({ id: `${component.id}-contract`, level: 'info', componentId: component.id, target: component.name, message: '属性契约或交互签名发生变化，建议创建快照并迁移示例。', field: 'properties' });
       }
+      if (component.a11yStale) {
+        issues.push({ id: `${component.id}-a11y`, level: 'warning', componentId: component.id, target: component.name, message: component.a11yStaleReason || '无障碍说明可能失效。', field: 'screenReader' });
+      }
     }
     return issues;
   }
@@ -234,7 +331,7 @@ export class SpecStore extends EventTarget {
     if (!previous) return;
     this.redoStack.push(clone(this.state));
     this.state = previous;
-    this.persist(false);
+    this.persistState(this.state);
     this.emit();
   }
 
@@ -243,7 +340,7 @@ export class SpecStore extends EventTarget {
     if (!next) return;
     this.undoStack.push(clone(this.state));
     this.state = next;
-    this.persist(false);
+    this.persistState(this.state);
     this.emit();
   }
 
@@ -251,7 +348,7 @@ export class SpecStore extends EventTarget {
     this.undoStack = [];
     this.redoStack = [];
     this.state = createInitialState();
-    this.persist(false);
+    this.persistState(this.state);
     this.emit();
   }
 
@@ -259,18 +356,46 @@ export class SpecStore extends EventTarget {
     const before = clone(this.state);
     const next = clone(this.state);
     mutator(next);
+    if (!this.persistState(next)) {
+      this.state = before;
+      this.emit();
+      return;
+    }
     this.undoStack.push(before);
     this.undoStack = this.undoStack.slice(-40);
     this.redoStack = [];
     this.lastAction = label;
     this.state = next;
-    this.persist();
     this.emit();
   }
 
-  private load(): WorkspaceState {
+  /** 事务性写入：超容量或写入失败返回 false，调用方负责回滚内存状态。 */
+  private persistState(state: WorkspaceState): boolean {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
+      localStorage.setItem(WORKSPACE_KEY, JSON.stringify(state));
+      return true;
+    } catch (error) {
+      this.lastError = error instanceof DOMException && error.name === 'QuotaExceededError'
+        ? '本地存储容量不足，整批写入已拒绝，原有工作区未改动。'
+        : '写入本地存储失败，原有工作区未改动。';
+      return false;
+    }
+  }
+
+  private persistSession(): boolean {
+    try {
+      if (this.reconcileSession) localStorage.setItem(SESSION_KEY, JSON.stringify(this.reconcileSession));
+      else localStorage.removeItem(SESSION_KEY);
+      return true;
+    } catch {
+      this.lastError = '对账进度写入本地存储失败，原有工作区未改动。';
+      return false;
+    }
+  }
+
+  private loadWorkspace(): WorkspaceState {
+    try {
+      const saved = localStorage.getItem(WORKSPACE_KEY);
       if (saved) return JSON.parse(saved) as WorkspaceState;
     } catch {
       // A corrupted local draft falls back to the bundled demo data.
@@ -278,8 +403,14 @@ export class SpecStore extends EventTarget {
     return createInitialState();
   }
 
-  private persist(_notify = true) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
+  private loadSession(): ReconcileSession | null {
+    try {
+      const saved = localStorage.getItem(SESSION_KEY);
+      if (saved) return JSON.parse(saved) as ReconcileSession;
+    } catch {
+      // Corrupted session: start fresh.
+    }
+    return null;
   }
 
   private emit() {
