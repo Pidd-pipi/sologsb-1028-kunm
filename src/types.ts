@@ -1,4 +1,4 @@
-export type ComponentStatus = 'draft' | 'review' | 'published';
+export type ComponentStatus = 'draft' | 'review' | 'published' | 'deprecated';
 export type PreviewTheme = 'light' | 'dark';
 export type PreviewDensity = 'compact' | 'regular' | 'spacious';
 
@@ -34,6 +34,9 @@ export interface ComponentSpec {
   screenReader: string;
   disabledScenarios: string;
   interactionSignature: string;
+  a11yGuidance?: string;
+  a11yStale?: boolean;
+  a11yStaleReason?: string;
   examples: ComponentExample[];
   revision: number;
   updatedAt: string;
@@ -47,9 +50,29 @@ export interface ComponentSnapshot {
   component: Omit<ComponentSpec, 'snapshots'>;
 }
 
+export interface SyncBaseline {
+  componentId: string;
+  updatedAt: string;
+  storedAt: string;
+  fields: Record<string, string | boolean>;
+  properties: Array<{
+    id: string;
+    name: string;
+    type: string;
+    required: boolean;
+    defaultValue: string;
+    description: string;
+  }>;
+}
+
 export interface WorkspaceState {
   components: ComponentSpec[];
+  archivedComponents: ComponentSpec[];
   selectedId: string;
+  syncBaselines: SyncBaseline[];
+  pendingReleases: import('./reconcile').PendingRelease[];
+  lastSyncAt: string;
+  reconciliationSessions: import('./reconcile').ReconciliationSession[];
 }
 
 export interface ValidationIssue {

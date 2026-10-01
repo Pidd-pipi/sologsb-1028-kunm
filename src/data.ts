@@ -20,6 +20,9 @@ const components: ComponentSpec[] = [
     screenReader: '使用原生 button；读屏应报告按钮名称、禁用状态和按下状态。',
     disabledScenarios: '不要让按钮承担跳转语义；异步提交时应禁用重复提交。',
     interactionSignature: 'Space/Enter 触发；disabled 时不响应',
+    a11yGuidance: '键盘：Tab 聚焦，Space/Enter 触发。\n读屏必须暴露按钮名称、禁用和按下状态。',
+    a11yStale: false,
+    a11yStaleReason: '',
     examples: [
       {
         id: 'example-button-primary',
@@ -61,6 +64,9 @@ const components: ComponentSpec[] = [
     screenReader: 'label 与 input 使用 for/id 关联，errorText 通过 aria-describedby 暴露。',
     disabledScenarios: '短枚举选项不应使用文本框。',
     interactionSignature: 'Tab 聚焦；invalid 时 aria-invalid=true',
+    a11yGuidance: '键盘：Tab 聚焦。\n读屏必须暴露 label、required 与 invalid 状态。',
+    a11yStale: false,
+    a11yStaleReason: '',
     examples: [
       {
         id: 'example-field-default',
@@ -93,6 +99,9 @@ const components: ComponentSpec[] = [
     screenReader: 'role=dialog、aria-modal=true，并在打开后播报标题。',
     disabledScenarios: '简单信息不要打断流程；不要嵌套模态对话框。',
     interactionSignature: 'Esc 关闭；Tab 焦点循环',
+    a11yGuidance: '键盘：Esc 关闭，Tab 循环焦点。\n读屏必须播报 dialog、标题与 modal 状态。',
+    a11yStale: false,
+    a11yStaleReason: '',
     examples: [
       {
         id: 'example-dialog-modal',
@@ -107,10 +116,89 @@ const components: ComponentSpec[] = [
     revision: 2,
     updatedAt: now,
     snapshots: []
+  },
+  {
+    id: 'legacy-action-button',
+    name: 'Legacy action button',
+    category: 'Actions',
+    status: 'draft',
+    purpose: '旧版动作按钮的本地迁移草稿。',
+    usage: '仅用于旧页面迁移，不建议用于新设计。',
+    properties: [
+      { id: 'p-legacy-label', name: 'label', type: 'string', required: true, defaultValue: '确定', description: '按钮文字。' }
+    ],
+    states: 'default、hover、disabled。',
+    keyboardBehavior: 'Enter 触发。',
+    screenReader: '读屏应报告按钮名称。',
+    disabledScenarios: '不要在新工具栏中使用。',
+    interactionSignature: 'Enter 触发',
+    a11yGuidance: '键盘：Enter 触发。\n读屏必须暴露按钮名称。',
+    a11yStale: false,
+    a11yStaleReason: '',
+    examples: [],
+    revision: 1,
+    updatedAt: now,
+    snapshots: []
+  },
+  {
+    id: 'legacy-action-button-v2',
+    name: 'Legacy action button',
+    category: 'Actions',
+    status: 'review',
+    purpose: '旧版动作按钮的第二份本地实验草稿。',
+    usage: '用于验证新 token，尚未与规范仓标识对齐。',
+    properties: [
+      { id: 'p-legacy-label-v2', name: 'label', type: 'string', required: true, defaultValue: '继续', description: '按钮文字。' }
+    ],
+    states: 'default、hover、disabled。',
+    keyboardBehavior: 'Enter 或 Space 触发。',
+    screenReader: '读屏应报告按钮名称和操作状态。',
+    disabledScenarios: '仅在迁移页面中使用。',
+    interactionSignature: 'Enter/Space 触发',
+    a11yGuidance: '键盘：Enter/Space 触发。\n读屏必须暴露按钮名称。',
+    a11yStale: false,
+    a11yStaleReason: '',
+    examples: [],
+    revision: 1,
+    updatedAt: now,
+    snapshots: []
   }
 ];
 
+const componentBaseline = (component: ComponentSpec) => ({
+  componentId: component.id,
+  updatedAt: component.updatedAt,
+  storedAt: now,
+  fields: {
+    name: component.name,
+    category: component.category,
+    status: component.status,
+    purpose: component.purpose,
+    usage: component.usage,
+    states: component.states,
+    keyboardBehavior: component.keyboardBehavior,
+    screenReader: component.screenReader,
+    disabledScenarios: component.disabledScenarios,
+    interactionSignature: component.interactionSignature
+  },
+  properties: component.properties.map(({ id, name, type, required, defaultValue, description }) => ({
+    id, name, type, required, defaultValue, description
+  }))
+});
+
+const syncBaselines = components.map(componentBaseline);
+const dialogBaseline = syncBaselines.find((item) => item.componentId === 'dialog-spec');
+if (dialogBaseline) {
+  dialogBaseline.updatedAt = '2026-09-20T08:00:00.000Z';
+  dialogBaseline.storedAt = '2026-09-20T08:00:00.000Z';
+}
+
 export const createInitialState = (): WorkspaceState => ({
   components: structuredClone(components),
-  selectedId: components[0].id
+  archivedComponents: [],
+  selectedId: components[0].id,
+  syncBaselines: syncBaselines,
+  pendingReleases: [],
+  lastSyncAt: now,
+  reconciliationSessions: []
 });

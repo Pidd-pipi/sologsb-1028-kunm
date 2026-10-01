@@ -2,9 +2,27 @@ import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
 import { diffAgainstSnapshot } from './diff';
 import { SpecStore } from './store';
-import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
+import type {
+  ComponentExample,
+  ComponentSpec,
+  PreviewDensity,
+  PreviewTheme,
+  PropertySpec,
+  ValidationIssue
+} from './types';
+import type {
+  ComponentActionDecision,
+  PendingRelease,
+  PropertyActionDecision,
+  ReconciliationSession,
+  ComponentReconcile,
+  PropertyReconcile,
+  ReconcileField,
+  RemotePackage
+} from './reconcile';
+import { getBlockingReasons } from './reconcile';
 
-type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
+type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history' | 'release';
 
 export class SpecA11yWorkbench extends LitElement {
   static properties = {
@@ -13,7 +31,9 @@ export class SpecA11yWorkbench extends LitElement {
     previewTheme: { state: true },
     previewDensity: { state: true },
     toast: { state: true },
-    showValidation: { state: true }
+    showValidation: { state: true },
+    activeSessionId: { state: true },
+    storageError: { state: true }
   };
 
   private store = new SpecStore();
@@ -23,6 +43,8 @@ export class SpecA11yWorkbench extends LitElement {
   private previewDensity: PreviewDensity = 'regular';
   private toast = '';
   private showValidation = true;
+  private activeSessionId = '';
+  private storageError = '';
   private toastTimer?: number;
 
   static styles = css`
@@ -110,6 +132,25 @@ export class SpecA11yWorkbench extends LitElement {
     .diff { display: grid; gap: 7px; margin-top: 9px; }
     .diff-row { border: 1px solid var(--spectrum-gray-300); border-radius: 8px; padding: 9px; font-size: 11px; }
     .diff-row b { display: block; margin-bottom: 4px; text-transform: capitalize; }
+    .release-stack { display: grid; gap: 14px; }
+    .release-summary { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+    .candidate { border: 1px solid var(--spectrum-gray-300); border-radius: 12px; padding: 14px; background: var(--spectrum-gray-100); display: grid; gap: 10px; }
+    .candidate.conflict { border-color: var(--spectrum-red-500); background: color-mix(in srgb, var(--spectrum-red-200) 45%, var(--spectrum-gray-50)); }
+    .candidate.ambiguous { border-color: var(--spectrum-orange-600); background: color-mix(in srgb, var(--spectrum-orange-200) 45%, var(--spectrum-gray-50)); }
+    .candidate.ready { border-color: var(--spectrum-green-600); }
+    .candidate-head { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+    .candidate-title { display: grid; gap: 3px; }
+    .candidate-title strong { font-size: 15px; }
+    .candidate-title span, .candidate small { color: var(--spectrum-gray-700); font-size: 12px; }
+    .decision-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 9px; }
+    .decision-field { border: 1px solid var(--spectrum-gray-300); border-radius: 9px; background: var(--spectrum-gray-50); padding: 9px; display: grid; gap: 6px; }
+    .decision-field.conflict { border-color: var(--spectrum-red-500); }
+    .decision-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    .side-button { border: 1px solid var(--spectrum-gray-400); border-radius: 7px; padding: 5px 8px; background: var(--spectrum-gray-50); cursor: pointer; font: inherit; font-size: 12px; }
+    .side-button[aria-pressed='true'] { border-color: var(--spectrum-blue-700); background: var(--spectrum-blue-200); font-weight: 700; }
+    .release-card { border-left: 4px solid var(--spectrum-blue-600); }
+    .pill.deprecated { background: var(--spectrum-red-300); }
+    .error-banner { border: 1px solid var(--spectrum-red-600); background: var(--spectrum-red-200); color: var(--spectrum-red-900); border-radius: 10px; padding: 10px 12px; font-size: 12px; }
     .before { color: var(--spectrum-red-800); white-space: pre-wrap; }
     .after { color: var(--spectrum-green-900); white-space: pre-wrap; }
     pre { white-space: pre-wrap; word-break: break-word; background: #202020; color: #f5f5f5; padding: 12px; border-radius: 8px; font-size: 12px; }
@@ -139,16 +180,27 @@ export class SpecA11yWorkbench extends LitElement {
   connectedCallback() {
     super.connectedCallback();
     this.store.addEventListener('change', this.onStoreChange);
+    this.store.addEventListener('error', this.onStoreError);
     window.addEventListener('keydown', this.onKeyDown);
+    this.activeSessionId = this.store.openSessions[0]?.id ?? this.store.state.pendingReleases[0]?.sessionId ?? '';
   }
 
   disconnectedCallback() {
     this.store.removeEventListener('change', this.onStoreChange);
+    this.store.removeEventListener('error', this.onStoreError);
     window.removeEventListener('keydown', this.onKeyDown);
   }
 
   private onStoreChange = () => {
+    this.storageError = this.store.lastError;
+    if (!this.activeSessionId) this.activeSessionId = this.store.openSessions[0]?.id ?? '';
     this.requestUpdate();
+  };
+
+  private onStoreError = (event: Event) => {
+    const detail = (event as CustomEvent<string>).detail;
+    this.storageError = detail;
+    this.flash(detail);
   };
 
   private onKeyDown = (event: KeyboardEvent) => {
@@ -174,7 +226,7 @@ export class SpecA11yWorkbench extends LitElement {
       this.store.addComponent();
       return;
     }
-    const tabMap: Record<string, EditorTab> = { '1': 'overview', '2': 'api', '3': 'accessibility', '4': 'examples', '5': 'history' };
+    const tabMap: Record<string, EditorTab> = { '1': 'overview', '2': 'api', '3': 'accessibility', '4': 'examples', '5': 'history', '6': 'release' };
     if (event.altKey && tabMap[event.key]) {
       event.preventDefault();
       this.tab = tabMap[event.key];
@@ -204,9 +256,12 @@ export class SpecA11yWorkbench extends LitElement {
               <sp-button variant="secondary" ?disabled=${!this.store.canUndo} @click=${() => this.store.undo()}>撤销</sp-button>
               <sp-button variant="secondary" ?disabled=${!this.store.canRedo} @click=${() => this.store.redo()}>重做</sp-button>
               <sp-button variant="accent" @click=${() => { this.store.createSnapshot('工具栏保存'); this.flash('版本已保存'); }}>保存版本</sp-button>
-              <span class="save-state">本地自动保存 · ${selected?.revision ?? 0} 版</span>
+              <sp-button variant="secondary" @click=${() => this.beginSampleReconciliation()}>示例规范包</sp-button>
+              <sp-button variant="secondary" @click=${() => this.openPackageFile()}>导入规范包</sp-button>
+              <span class="save-state">本地自动保存 · ${selected?.revision ?? 0} 版${this.store.openSessions.length ? ` · ${this.store.openSessions.length} 个对账进行中` : ''}</span>
             </div>
           </header>
+          ${this.storageError ? html`<div class="error-banner" role="alert">${this.storageError}</div>` : nothing}
           <div class="layout">
             <aside class="sidebar" aria-label="组件目录">
               <div class="sidebar-heading">
@@ -232,7 +287,8 @@ export class SpecA11yWorkbench extends LitElement {
             </aside>
           </div>
           ${this.toast ? html`<sp-toast open variant="positive" timeout="3000">${this.toast}</sp-toast>` : nothing}
-          <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–5 切换面板</div>
+          <input type="file" accept="application/json,.json" hidden @change=${(event: Event) => this.importPackageFile(event)} />
+          <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–6 切换面板</div>
         </div>
       </sp-theme>
     `;
@@ -261,12 +317,14 @@ export class SpecA11yWorkbench extends LitElement {
         ${this.renderTab('accessibility', '3 无障碍')}
         ${this.renderTab('examples', '4 示例')}
         ${this.renderTab('history', '5 版本')}
+        ${this.renderTab('release', '6 跨仓对账')}
       </div>
       ${this.tab === 'overview' ? this.renderOverview(component) : nothing}
       ${this.tab === 'api' ? this.renderApi(component) : nothing}
       ${this.tab === 'accessibility' ? this.renderAccessibility(component) : nothing}
       ${this.tab === 'examples' ? this.renderExamples(component) : nothing}
       ${this.tab === 'history' ? this.renderHistory(component) : nothing}
+      ${this.tab === 'release' ? this.renderReconciliation() : nothing}
     `;
   }
 
@@ -328,6 +386,15 @@ export class SpecA11yWorkbench extends LitElement {
     return html`
       <section class="panel">
         <div class="form-grid">
+          <div class="property-head">
+            <h2>无障碍</h2>
+            <div class="actions">
+              <sp-button size="s" variant="secondary" @click=${() => this.store.recomputeSelectedA11y()}>重算说明</sp-button>
+              <sp-button size="s" variant="accent" ?disabled=${component.a11yStale} @click=${() => this.store.acknowledgeA11y()}>采用重算结果</sp-button>
+            </div>
+          </div>
+          ${component.a11yStale ? html`<div class="issue warning"><strong>无障碍依赖已失效</strong>${component.a11yStaleReason || '属性契约已变化，自动说明已重算，待人工确认。'}</div>` : nothing}
+          ${component.a11yGuidance ? html`<label class="field full"><span>即时重算的无障碍依赖说明</span><textarea .value=${component.a11yGuidance} readonly></textarea></label>` : nothing}
           <label class="field full"><span>键盘行为</span><textarea .value=${component.keyboardBehavior} @change=${(event: Event) => this.store.updateComponent({ keyboardBehavior: (event.currentTarget as HTMLTextAreaElement).value }, true)}></textarea></label>
           <label class="field full"><span>读屏说明</span><textarea .value=${component.screenReader} @change=${(event: Event) => this.store.updateComponent({ screenReader: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
           <label class="field full"><span>禁用场景</span><textarea .value=${component.disabledScenarios} @change=${(event: Event) => this.store.updateComponent({ disabledScenarios: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
@@ -401,6 +468,172 @@ export class SpecA11yWorkbench extends LitElement {
     `;
   }
 
+  private renderReconciliation(): TemplateResult {
+    const sessions = this.store.recentSessions;
+    const session = sessions.find((item) => item.id === this.activeSessionId) ?? sessions[0];
+    return html`
+      <section class="panel">
+        <div class="release-summary">
+          <div>
+            <h2>跨仓对账与待发布版本</h2>
+            <p>先按标识配对；标识缺失时再按名称和类型确认。候选、双端新值、下架碰改值未裁定前不能生成发布版本。</p>
+          </div>
+          <div class="actions">
+            <select aria-label="选择对账会话" .value=${session?.id ?? ''} @change=${(event: Event) => { this.activeSessionId = (event.currentTarget as HTMLSelectElement).value; }}>
+              ${sessions.length ? sessions.map((item) => html`<option value=${item.id}>${item.packageName} ${item.packageVersion} · ${this.sessionStatusLabel(item.status)}</option>`) : html`<option value="">暂无对账会话</option>`}
+            </select>
+            <sp-button variant="secondary" @click=${() => this.beginSampleReconciliation()}>示例规范包</sp-button>
+            <sp-button variant="secondary" @click=${() => this.openPackageFile()}>导入 JSON</sp-button>
+          </div>
+        </div>
+        ${this.renderPendingReleases()}
+        ${session ? this.renderSession(session) : html`<div class="empty">导入规范包后开始对账。关闭页面后，未完成候选、裁定和待发布版本仍会保留在本地存储。</div>`}
+      </section>
+    `;
+  }
+
+  private renderPendingReleases() {
+    const releases = this.store.state.pendingReleases;
+    if (!releases.length) return nothing;
+    return html`
+      <div class="release-stack" style="margin: 14px 0">
+        ${releases.map((release) => html`
+          <div class="candidate release-card">
+            <div class="candidate-head">
+              <div class="candidate-title"><strong>${release.packageName} ${release.packageVersion}</strong><span>待发布 · ${release.components.length} 项 · ${new Date(release.createdAt).toLocaleString('zh-CN')}</span></div>
+              <div class="actions">
+                <sp-button size="s" variant="secondary" @click=${() => { this.activeSessionId = release.sessionId; }}>查看裁定</sp-button>
+                <sp-button size="s" variant="accent" @click=${() => this.publishRelease(release.id)}>确认发布</sp-button>
+              </div>
+            </div>
+            <small>${release.components.map((item) => `${item.component.name}（${this.actionLabel(item.action)}）`).join('、')}</small>
+          </div>
+        `)}
+      </div>
+    `;
+  }
+
+  private renderSession(session: ReconciliationSession): TemplateResult {
+    const blockers = this.blockingReasons(session);
+    const release = this.store.state.pendingReleases.find((item) => item.sessionId === session.id);
+    return html`
+      <div class="candidate" style="margin-top: 14px">
+        <div class="candidate-head">
+          <div class="candidate-title">
+            <strong>${session.packageName} ${session.packageVersion}</strong>
+            <span>导出于 ${new Date(session.exportedAt).toLocaleString('zh-CN')} · 最近更新 ${new Date(session.updatedAt).toLocaleString('zh-CN')} · ${this.sessionStatusLabel(session.status)}</span>
+          </div>
+          <div class="actions">
+            <sp-button size="s" variant="secondary" ?disabled=${session.status === 'published'} @click=${() => this.store.refreshSession(session.id)}>按当前草稿重扫</sp-button>
+            <sp-button size="s" variant="secondary" ?disabled=${Boolean(blockers.length) || session.status === 'published'} @click=${() => this.store.resolveAllConflicts(session.id, 'remote')}>全取规范仓</sp-button>
+            <sp-button size="s" variant="secondary" ?disabled=${Boolean(blockers.length) || session.status === 'published'} @click=${() => this.store.resolveAllConflicts(session.id, 'local')}>全保留本地</sp-button>
+            <sp-button size="s" variant="accent" ?disabled=${blockers.length > 0 || session.status === 'published'} @click=${() => this.store.generateRelease(session.id)}>生成待发布版本</sp-button>
+            <sp-button size="s" variant="secondary" ?disabled=${session.status === 'published'} @click=${() => this.discardSession(session.id)}>放弃</sp-button>
+          </div>
+        </div>
+        ${blockers.length ? html`<div class="issue error"><strong>发布闸门：还有 ${blockers.length} 类未裁定项</strong>${blockers.map((item) => html`<div>• ${item}</div>`)}</div>` : html`<div class="issue info"><strong>候选已裁定</strong>${release ? '待发布版本已生成；旧工作区尚未覆盖。' : '可以生成待发布版本。'}</div>`}
+        <div class="release-stack">
+          ${session.components.map((component) => this.renderComponentCandidate(session.id, component, session.status === 'published'))}
+        </div>
+      </div>
+    `;
+  }
+
+  private renderComponentCandidate(sessionId: string, component: ComponentReconcile, readonly: boolean): TemplateResult {
+    const actionOptions: ComponentActionDecision[] = component.remote.removed ? ['remove', 'deprecate', 'skip'] : ['update', 'skip'];
+    return html`
+      <article class="candidate ${component.state === 'unchanged' ? 'ready' : component.state}">
+        <div class="candidate-head">
+          <div class="candidate-title">
+            <strong>${component.remote.name}</strong>
+            <span>${component.remote.category ?? 'General'} · ${component.remote.id ? `组件标识 ${component.remote.id}` : '缺少组件标识'} · ${this.stateLabel(component.state)}</span>
+            ${component.blockingReason ? html`<small>${component.blockingReason}</small>` : nothing}
+          </div>
+          <span class="pill ${component.state === 'ready' ? 'published' : 'review'}">${this.stateLabel(component.state)}</span>
+        </div>
+        <div class="decision-grid">
+          <label class="field"><span>组件配对</span>${this.componentMatchControl(sessionId, component, readonly)}</label>
+          <label class="field"><span>处理动作</span><select ?disabled=${readonly} .value=${component.action} @change=${(event: Event) => this.store.resolveComponentAction(sessionId, component.remoteKey, (event.currentTarget as HTMLSelectElement).value as ComponentActionDecision)}>
+            <option value="">请选择</option>
+            ${actionOptions.map((value) => html`<option value=${value}>${this.actionLabel(value)}</option>`)}
+          </select></label>
+        </div>
+        <div class="decision-grid">${component.fields.map((field) => this.renderFieldDecision(sessionId, component.remoteKey, field, readonly))}</div>
+        ${component.properties.length ? html`<div class="release-stack">${component.properties.map((property) => this.renderPropertyCandidate(sessionId, component.remoteKey, property, readonly))}</div>` : nothing}
+      </article>
+    `;
+  }
+
+  private componentMatchControl(sessionId: string, component: ComponentReconcile, readonly: boolean): TemplateResult {
+    if (component.remote.id) {
+      return html`
+        <select ?disabled=${readonly} .value=${component.selectedLocalId ?? ''} @change=${(event: Event) => {
+          const value = (event.currentTarget as HTMLSelectElement).value;
+          this.store.resolveComponentMatch(sessionId, component.remoteKey, value === '__new__' ? 'new' : value === '__skip__' ? 'skip' : 'id', value.startsWith('__') ? '' : value);
+        }}>
+          <option value="">请选择候选</option>${component.localCandidates.map((item) => html`<option value=${item.id}>${item.name} · ${item.category} · ${item.id}</option>`)}<option value="__new__">作为新组件加入</option><option value="__skip__">不处理</option>
+        </select>
+      `;
+    }
+    return html`
+      <select ?disabled=${readonly} @change=${(event: Event) => {
+        const value = (event.currentTarget as HTMLSelectElement).value;
+        this.store.resolveComponentMatch(sessionId, component.remoteKey, value === '__new__' ? 'new' : value === '__skip__' ? 'skip' : 'match', value.startsWith('__') ? '' : value);
+      }}>
+        <option value="">按名称和类型确认</option>${component.localCandidates.map((item) => html`<option value=${item.id}>${item.name} · ${item.category} · ${item.id}</option>`)}<option value="__new__">作为新组件加入</option><option value="__skip__">不处理</option>
+      </select>
+    `;
+  }
+
+  private renderPropertyCandidate(sessionId: string, componentKey: string, property: PropertyReconcile, readonly: boolean): TemplateResult {
+    const actionOptions: PropertyActionDecision[] = property.remote.removed ? ['remove', 'skip'] : ['update', 'create', 'remove', 'skip'];
+    return html`
+      <div class="candidate ${property.state === 'unchanged' ? 'ready' : property.state}">
+        <div class="candidate-head">
+          <div class="candidate-title"><strong>${property.remote.name}: ${property.remote.type}</strong><span>${property.remote.id ? `属性标识 ${property.remote.id}` : '缺少属性标识，按名称+类型匹配'} · ${this.stateLabel(property.state)}</span>${property.blockingReason ? html`<small>${property.blockingReason}</small>` : nothing}</div>
+        </div>
+        <div class="decision-grid">
+          <label class="field"><span>属性配对</span>${this.propertyMatchControl(sessionId, componentKey, property, readonly)}</label>
+          <label class="field"><span>属性动作</span><select ?disabled=${readonly} .value=${property.action} @change=${(event: Event) => this.store.resolvePropertyAction(sessionId, componentKey, property.remoteKey, (event.currentTarget as HTMLSelectElement).value as PropertyActionDecision)}>
+            <option value="">请选择</option>${actionOptions.map((value) => html`<option value=${value}>${this.actionLabel(value)}</option>`)}
+          </select></label>
+        </div>
+        <div class="decision-grid">${property.fields.map((field) => this.renderPropertyFieldDecision(sessionId, componentKey, property.remoteKey, field, readonly))}</div>
+      </div>
+    `;
+  }
+
+  private propertyMatchControl(sessionId: string, componentKey: string, property: PropertyReconcile, readonly: boolean): TemplateResult {
+    return html`
+      <select ?disabled=${readonly} @change=${(event: Event) => {
+        const value = (event.currentTarget as HTMLSelectElement).value;
+        this.store.resolvePropertyMatch(sessionId, componentKey, property.remoteKey, value === '__create__' ? 'create' : value === '__skip__' ? 'skip' : property.remote.id ? 'id' : 'match', value.startsWith('__') ? '' : value);
+      }}>
+        <option value="">请选择候选</option>${property.localCandidates.map((item) => html`<option value=${item.id}>${item.name} · ${item.type} · ${item.componentId} · ${item.id}</option>`)}<option value="__create__">新增属性</option><option value="__skip__">不处理</option>
+      </select>
+    `;
+  }
+
+  private renderFieldDecision(sessionId: string, componentKey: string, field: ReconcileField, readonly: boolean): TemplateResult {
+    return html`
+      <div class="decision-field ${field.state === 'conflict' ? 'conflict' : ''}">
+        <strong>${field.label}</strong>
+        <small>本地：${this.displayValue(field.localValue)} ｜ 规范仓：${this.displayValue(field.remoteValue)}</small>
+        ${field.state === 'conflict' ? html`<div class="decision-row"><button class="side-button" ?disabled=${readonly} aria-pressed=${field.decision === 'local'} @click=${() => this.store.resolveComponentField(sessionId, componentKey, field.field, 'local')}>取本地</button><button class="side-button" ?disabled=${readonly} aria-pressed=${field.decision === 'remote'} @click=${() => this.store.resolveComponentField(sessionId, componentKey, field.field, 'remote')}>取规范仓</button></div>` : html`<small>${this.stateLabel(field.state)}</small>`}
+      </div>
+    `;
+  }
+
+  private renderPropertyFieldDecision(sessionId: string, componentKey: string, propertyKey: string, field: ReconcileField, readonly: boolean): TemplateResult {
+    return html`
+      <div class="decision-field ${field.state === 'conflict' ? 'conflict' : ''}">
+        <strong>${field.label}</strong>
+        <small>本地：${this.displayValue(field.localValue)} ｜ 规范仓：${this.displayValue(field.remoteValue)}</small>
+        ${field.state === 'conflict' ? html`<div class="decision-row"><button class="side-button" ?disabled=${readonly} aria-pressed=${field.decision === 'local'} @click=${() => this.store.resolvePropertyField(sessionId, componentKey, propertyKey, field.field, 'local')}>取本地</button><button class="side-button" ?disabled=${readonly} aria-pressed=${field.decision === 'remote'} @click=${() => this.store.resolvePropertyField(sessionId, componentKey, propertyKey, field.field, 'remote')}>取规范仓</button></div>` : html`<small>${this.stateLabel(field.state)}</small>`}
+      </div>
+    `;
+  }
+
   private renderPreview(component?: ComponentSpec): TemplateResult {
     if (!component) return html`<section class="panel"><h2>预览</h2><p>选择组件后显示主题与密度预览。</p></section>`;
     return html`
@@ -437,6 +670,72 @@ export class SpecA11yWorkbench extends LitElement {
     `;
   }
 
+  private openPackageFile() {
+    this.renderRoot.querySelector<HTMLInputElement>('input[type="file"]')?.click();
+  }
+
+  private async importPackageFile(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text()) as RemotePackage;
+      if (!parsed.id || !parsed.name || !parsed.version || !Array.isArray(parsed.components)) {
+        throw new Error('规范包必须包含 id、name、version 和 components。');
+      }
+      this.store.startReconciliation(parsed);
+      this.activeSessionId = this.store.openSessions[0]?.id ?? '';
+      this.tab = 'release';
+      this.flash('规范包已导入，开始跨仓对账');
+    } catch (error) {
+      this.flash(error instanceof Error ? error.message : '规范包解析失败');
+    } finally {
+      input.value = '';
+    }
+  }
+
+  private beginSampleReconciliation() {
+    this.store.useSamplePackage();
+    this.activeSessionId = this.store.openSessions[0]?.id ?? '';
+    this.tab = 'release';
+    this.flash('规范包已导入，开始跨仓对账');
+  }
+
+  private discardSession(sessionId: string) {
+    if (!window.confirm('放弃该对账会话？本地工作区不会丢失，只会移除该批候选和待发布版本。')) return;
+    this.store.discardSession(sessionId);
+    this.flash('对账会话已放弃，工作区保持不变');
+  }
+
+  private publishRelease(releaseId: string) {
+    const release: PendingRelease | undefined = this.store.state.pendingReleases.find((item) => item.id === releaseId);
+    if (!release) return;
+    if (!window.confirm(`发布 ${release.packageName} ${release.packageVersion}？旧版本会保留为快照，下架组件会归档。`)) return;
+    this.store.publishRelease(releaseId);
+    this.flash('待发布版本已应用');
+  }
+
+  private blockingReasons(session: ReconciliationSession): string[] {
+    return [...new Set(getBlockingReasons(session))];
+  }
+
+  private stateLabel(state: string): string {
+    return { ready: '可裁定', conflict: '冲突', ambiguous: '候选待定', unchanged: '保持' }[state] ?? state;
+  }
+
+  private actionLabel(action: string): string {
+    return { update: '更新', remove: '下架/移除', deprecate: '标记废弃', skip: '保留本地', create: '新增' }[action] ?? action;
+  }
+
+  private sessionStatusLabel(status: string): string {
+    return { open: '处理中', 'release-ready': '待发布', published: '已发布', discarded: '已放弃' }[status] ?? status;
+  }
+
+  private displayValue(value: string | boolean | undefined): string {
+    if (value === undefined) return '—';
+    return value === '' ? '（空）' : String(value);
+  }
+
   private get filteredComponents(): ComponentSpec[] {
     const query = this.query.trim().toLowerCase();
     if (!query) return this.store.state.components;
@@ -448,7 +747,7 @@ export class SpecA11yWorkbench extends LitElement {
   }
 
   private statusLabel(status: ComponentSpec['status']): string {
-    return { draft: '草稿', review: '待审', published: '已发布' }[status];
+    return { draft: '草稿', review: '待审', published: '已发布', deprecated: '已废弃' }[status];
   }
 
   private async copy(value: string) {
